@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: NT548 Lab 01 - public/private EC2 instances with a NAT gateway.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nt548-lab01
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.2.0/24
+  AllowedSshCidr:
+    Type: String
+    Default: 125.235.233.10/32
+    Description: Public IPv4 CIDR allowed to SSH to the public instance.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: nt548-lab01-key
+  AmiParameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  ExistingLambdaRoleArn:
+    Type: String
+    Default: ''
+    Description: Optional existing Lambda execution role (for example an authorized Learner Lab role); otherwise create a role.
+
+Conditions:
+  CreateLambdaRole: !Equals [!Ref ExistingLambdaRoleArn, '']
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-vpc'}
+        - {Key: Project, Value: !Ref ProjectName}
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-public-subnet'}
+        - {Key: Project, Value: !Ref ProjectName}
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-private-subnet'}
+        - {Key: Project, Value: !Ref ProjectName}
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-igw'}
+        - {Key: Project, Value: !Ref ProjectName}
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-nat-eip'}
+        - {Key: Project, Value: !Ref ProjectName}
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: GatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      ConnectivityType: public
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-nat'}
+        - {Key: Project, Value: !Ref ProjectName}
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-public-rt'}
+        - {Key: Project, Value: !Ref ProjectName}
+  PublicInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-private-rt'}
+        - {Key: Project, Value: !Ref ProjectName}
+  PrivateInternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+  PublicSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-public-sg'
+      GroupDescription: SSH access to public EC2
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSshCidr
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-public-sg'}
+        - {Key: Project, Value: !Ref ProjectName}
+  PrivateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-private-sg'
+      GroupDescription: SSH access from public EC2
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !GetAtt PublicSecurityGroup.GroupId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-private-sg'}
+        - {Key: Project, Value: !Ref ProjectName}
+
+  # CloudFormation has no native equivalent of aws_default_security_group.
+  DefaultSecurityGroupRole:
+    Type: AWS::IAM::Role
+    Condition: CreateLambdaRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: RestrictDefaultSecurityGroup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeSecurityGroups
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateTags
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${GroupId}'
+                  - GroupId: !GetAtt Vpc.DefaultSecurityGroup
+  DefaultSecurityGroupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !If [CreateLambdaRole, !GetAtt DefaultSecurityGroupRole.Arn, !Ref ExistingLambdaRoleArn]
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              props = event['ResourceProperties']
+              group_id = props['GroupId']
+              physical_id = event.get('PhysicalResourceId', group_id)
+              try:
+                  if event['RequestType'] != 'Delete':
+                      ec2 = boto3.client('ec2')
+                      group = ec2.describe_security_groups(GroupIds=[group_id])['SecurityGroups'][0]
+                      if group['GroupName'] != 'default' or group['VpcId'] != props['VpcId']:
+                          raise ValueError('Expected the default security group of the stack VPC')
+                      for field, revoke in [
+                          ('IpPermissions', ec2.revoke_security_group_ingress),
+                          ('IpPermissionsEgress', ec2.revoke_security_group_egress),
+                      ]:
+                          if group.get(field):
+                              revoke(GroupId=group_id, IpPermissions=group[field])
+                      ec2.create_tags(Resources=[group_id], Tags=[
+                          {'Key': 'Name', 'Value': props['ProjectName'] + '-default-sg'},
+                          {'Key': 'Project', 'Value': props['ProjectName']},
+                      ])
+                      physical_id = group_id
+                  # The VPC owns this group; leave it restricted until the VPC is deleted.
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+              except Exception as error:
+                  print(str(error))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, physical_id,
+                                   reason=str(error))
+  RestrictDefaultSecurityGroup:
+    Type: Custom::RestrictDefaultSecurityGroup
+    Properties:
+      ServiceToken: !GetAtt DefaultSecurityGroupFunction.Arn
+      ServiceTimeout: 120
+      GroupId: !GetAtt Vpc.DefaultSecurityGroup
+      VpcId: !Ref Vpc
+      ProjectName: !Ref ProjectName
+
+  InstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiParameter
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        MetadataOptions:
+          HttpTokens: required
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+  PublicInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [PublicInternetRoute, PublicRouteAssociation, RestrictDefaultSecurityGroup]
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref InstanceLaunchTemplate
+        Version: !GetAtt InstanceLaunchTemplate.LatestVersionNumber
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          SubnetId: !Ref PublicSubnet
+          GroupSet: [!GetAtt PublicSecurityGroup.GroupId]
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-public-ec2'}
+        - {Key: Project, Value: !Ref ProjectName}
+  PrivateInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [PublicInternetRoute, PublicRouteAssociation, PrivateInternetRoute, PrivateRouteAssociation, RestrictDefaultSecurityGroup]
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref InstanceLaunchTemplate
+        Version: !GetAtt InstanceLaunchTemplate.LatestVersionNumber
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          SubnetId: !Ref PrivateSubnet
+          GroupSet: [!GetAtt PrivateSecurityGroup.GroupId]
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-private-ec2'}
+        - {Key: Project, Value: !Ref ProjectName}
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
+  PublicEc2Id:
+    Value: !Ref PublicInstance
+  PrivateEc2Id:
+    Value: !Ref PrivateInstance
+  PublicEc2Ip:
+    Value: !GetAtt PublicInstance.PublicIp
+  PrivateEc2Ip:
+    Value: !GetAtt PrivateInstance.PrivateIp
+  Ec2AmiId:
+    Value: !Ref AmiParameter
